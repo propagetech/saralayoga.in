@@ -1,1 +1,205 @@
-cert-renewal.yml
+name: Origin cert auto-renewal
+
+# Detects and auto-resolves the 90-day GitHub Pages Let's Encrypt cert renewal
+# trap that occurs when fronting GitHub Pages with Cloudflare's proxy.
+#
+# Runs every 6 hours. State lives in Cloudflare itself (proxy on/off), so the
+# workflow is stateless and idempotent — safe to retry, safe to run manually,
+# self-recovers if any single run fails.
+#
+# State machine:
+#   - Proxy ON,  cert >25d remaining  -> idle
+#   - Proxy ON,  cert <25d remaining  -> start: flip records to DNS-only, nudge Pages API
+#   - Proxy OFF, cert <60d remaining  -> wait: GitHub renewing in background, check again in 6h
+#   - Proxy OFF, cert >60d remaining  -> finalize: flip records back to Proxied, purge cache
+#
+# Self-reporting: if any step fails, the final step opens a GitHub issue with
+# label `cert-renewal-failure`. Repeat failures append as comments to the
+# same issue (no spam). Close the issue once you've fixed the cause.
+#
+# Required setup:
+#   Repo variable (Actions -> Variables tab, NOT Secrets):
+#     CUSTOM_DOMAIN          your apex domain (e.g. example.com)
+#
+#   Repo secrets (Actions -> Secrets tab):
+#     CF_ZONE_ID             Cloudflare zone overview, right sidebar
+#     CF_API_TOKEN           scope: Zone > Cache Purge > Purge        (single zone)
+#     CF_API_TOKEN_DNS       scope: Zone > DNS > Edit                  (single zone)
+#
+#   GITHUB_TOKEN works by default with the permissions block below.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  pages: write       # for the Pages API call that nudges cert renewal
+  contents: read
+  issues: write      # for the failure self-report step
+
+concurrency:
+  group: cert-renewal
+  cancel-in-progress: false
+
+env:
+  DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+  ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+  CF_DNS_TOKEN: ${{ secrets.CF_API_TOKEN_DNS }}
+  CF_PURGE_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Inspect DNS state
+        id: dns
+        run: |
+          curl -fsS \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?per_page=100" \
+            -H "Authorization: Bearer $CF_DNS_TOKEN" > records.json
+
+          jq -r --arg dom "$DOMAIN" '.result[]
+            | select((.name == $dom or .name == ("www." + $dom))
+                    and (.type == "A" or .type == "AAAA" or .type == "CNAME"))
+            | "\(.id) \(.proxied)"' records.json > records_state.txt
+
+          if grep -q " false$" records_state.txt; then
+            echo "proxy=off" >> "$GITHUB_OUTPUT"
+          else
+            echo "proxy=on" >> "$GITHUB_OUTPUT"
+          fi
+
+          cut -d' ' -f1 records_state.txt > record_ids.txt
+          echo "Current records:"
+          cat records_state.txt
+
+      - name: Inspect origin cert expiry
+        id: cert
+        run: |
+          END_DATE=$(echo | timeout 10 openssl s_client \
+            -connect 185.199.108.153:443 \
+            -servername "$DOMAIN" 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null \
+            | cut -d= -f2 || echo "")
+
+          if [ -z "$END_DATE" ]; then
+            echo "::warning::Cert probe failed; treating as expiring"
+            DAYS=0
+          else
+            DAYS=$(( ($(date -d "$END_DATE" +%s) - $(date +%s)) / 86400 ))
+            echo "::notice::Origin cert expires $END_DATE ($DAYS days remaining)"
+          fi
+          echo "days=$DAYS" >> "$GITHUB_OUTPUT"
+
+      - name: Decide action
+        id: decide
+        env:
+          PROXY: ${{ steps.dns.outputs.proxy }}
+          DAYS: ${{ steps.cert.outputs.days }}
+        run: |
+          if [ "$PROXY" = "on" ] && [ "$DAYS" -lt 25 ]; then
+            ACTION=start
+          elif [ "$PROXY" = "off" ] && [ "$DAYS" -gt 60 ]; then
+            ACTION=finalize
+          elif [ "$PROXY" = "off" ]; then
+            ACTION=wait
+          else
+            ACTION=idle
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Action=$ACTION (proxy=$PROXY, days=$DAYS)"
+
+      - name: Start — flip records to DNS-only
+        if: steps.decide.outputs.action == 'start'
+        run: |
+          while read ID; do
+            curl -fsS -X PATCH \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$ID" \
+              -H "Authorization: Bearer $CF_DNS_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data '{"proxied":false}' > /dev/null
+            echo "Record $ID -> DNS only"
+          done < record_ids.txt
+
+      - name: Start — nudge GitHub Pages renewal
+        if: steps.decide.outputs.action == 'start'
+        run: |
+          curl -fsS -X PUT \
+            "https://api.github.com/repos/${{ github.repository }}/pages" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            --data "{\"cname\":\"$DOMAIN\",\"https_enforced\":true}" || \
+              echo "::warning::Pages API nudge failed; GitHub will still renew on its own cron"
+
+      - name: Finalize — flip records back to Proxied
+        if: steps.decide.outputs.action == 'finalize'
+        run: |
+          while read ID; do
+            curl -fsS -X PATCH \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$ID" \
+              -H "Authorization: Bearer $CF_DNS_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data '{"proxied":true}' > /dev/null
+            echo "Record $ID -> Proxied"
+          done < record_ids.txt
+
+      - name: Finalize — purge Cloudflare cache
+        if: steps.decide.outputs.action == 'finalize'
+        run: |
+          sleep 15
+          curl -fsS -X POST \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+            -H "Authorization: Bearer $CF_PURGE_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}' > /dev/null
+          echo "Cache purged after proxy restoration"
+
+      - name: Wait state
+        if: steps.decide.outputs.action == 'wait'
+        run: echo "::notice::Proxy is off, GitHub renewing in background. Next check in 6 hours."
+
+      - name: Idle
+        if: steps.decide.outputs.action == 'idle'
+        run: echo "::notice::Cert is fresh, proxy is on. Nothing to do."
+
+      - name: Self-report on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          # Look for an existing open issue with our failure label
+          EXISTING=$(curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues?state=open&labels=cert-renewal-failure" \
+            | jq -r '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/$EXISTING/comments" \
+              --data "$(jq -n --arg ts "$TS" --arg url "$RUN_URL" \
+                '{body: ("Another failure on \($ts).\n\nRun: \($url)")}')" > /dev/null
+            echo "::warning::Appended failure comment to existing issue #$EXISTING"
+          else
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues" \
+              --data "$(jq -n --arg ts "$TS" --arg url "$RUN_URL" \
+                '{
+                  title: "🚨 Cert auto-renewal workflow failed",
+                  body: ("The cert-renewal workflow failed at \($ts).\n\n**Failed run:** \($url)\n\n**Likely causes:**\n- `CF_API_TOKEN_DNS` expired or revoked\n- GitHub Pages API returned 403 (default GITHUB_TOKEN may lack permission; swap to a PAT with `repo` scope stored as a new secret)\n- Cloudflare API rate limit hit\n- Network timeout during openssl probe\n\n**Action required:**\n1. Open the failed run log via the link above\n2. Identify the failing step from the logs\n3. Fix the root cause\n4. Re-run the workflow via the Actions tab\n5. Close this issue once renewal succeeds\n\nFurther failures will be appended as comments to this issue (no spam)."),
+                  labels: ["cert-renewal-failure"]
+                }')" > /dev/null
+            echo "::warning::Opened new failure issue"
+          fi

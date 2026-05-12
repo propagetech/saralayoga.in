@@ -1,1 +1,29 @@
-cloudflare-purge.yml
+name: Purge Cloudflare cache
+
+# Chains off the custom deploy workflow (deploy.yml).
+# Fires automatically after every successful publish — zero human action required.
+#
+# IMPORTANT: the workflows: array below must match the `name:` field in deploy.yml
+# exactly. If you rename the deploy workflow, update this trigger.
+#
+# Required setup:
+#   Repo secrets (Settings -> Secrets and variables -> Actions):
+#     CF_ZONE_ID      Cloudflare zone overview, right sidebar
+#     CF_API_TOKEN    scope: Zone > Cache Purge > Purge        (single zone, least-privilege)
+
+on:
+  workflow_run:
+    workflows: ["Deploy static site to GitHub Pages"]
+    types: [completed]
+
+jobs:
+  purge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge Everything
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}'

@@ -1,5 +1,16 @@
 name: Deploy static site to GitHub Pages
 
+# Builds and publishes the site on every push to main. Replaces the legacy
+# "Deploy from a branch" mode with explicit, customisable build steps.
+#
+# Includes a sitemap.xml lastmod refresh — search engines see a fresh timestamp
+# on every deploy without any manual editing.
+#
+# IMPORTANT: cloudflare-purge.yml chains off this workflow's `name:` field
+# ("Deploy static site to GitHub Pages"). If you rename this workflow, update
+# the `workflows:` array in cloudflare-purge.yml to match, otherwise Cloudflare's
+# cache won't auto-purge on deploys.
+
 on:
   push:
     branches: [ main ]
